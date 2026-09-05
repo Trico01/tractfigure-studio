@@ -1774,6 +1774,11 @@ def configure_cli() -> argparse.Namespace:
         type=int,
         default=8080,
     )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Do not open a browser tab automatically (used when a launcher already controls it).",
+    )
 
     args, _unknown = parser.parse_known_args()
     return args
@@ -1832,7 +1837,7 @@ def main() -> None:
 
     server.start(
         port=args.app_port,
-        open_browser=True,
+        open_browser=not args.no_browser,
         show_connection_info=True,
     )
 

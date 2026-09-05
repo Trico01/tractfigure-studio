@@ -6,7 +6,9 @@ import os
 import socket
 import subprocess
 import sys
+import tkinter as tk
 from pathlib import Path
+from tkinter import filedialog
 from typing import Any
 
 import nibabel as nib
@@ -17,6 +19,7 @@ from trame.widgets import client
 from trame.widgets import vuetify3 as v3
 
 from tractfigure.gui.app_trame_v1_20260730 import load_recipe, scene_from_inputs
+from tractfigure.io import SUPPORTED_EXTENSIONS
 from tractfigure.renderer_trame_v1_20260730 import SceneRenderer
 from tractfigure.scene_state_v1_20260730 import SceneState
 
@@ -25,6 +28,88 @@ DEMO_RECIPE_PATH = PROJECT_ROOT / "examples" / "recipes" / "five_bundle_trame_v1
 DEMO_TEMPLATE_PATH = (
     PROJECT_ROOT / "demo_data" / "cache" / "mni_template" / "mni_icbm152_t1_tal_nlin_asym_09a.nii"
 )
+
+# No extension filters: Tk/native file dialogs (especially on macOS) handle
+# compound extensions like ".nii.gz" unreliably regardless of exact pattern
+# syntax, sometimes hiding matching files under a restrictive filter. Showing
+# everything and relying on the loader's own validation (which gives a clear
+# error for the wrong kind of file) is simpler and always correct.
+ALL_FILES_FILETYPES = [("All files", "*.*")]
+
+
+def _activate_process_frontmost() -> None:
+    """macOS: raise this background process above other apps (e.g. Chrome).
+
+    A plain `python -m ...` process has no app-level focus the way a
+    double-clicked .app does, so its dialogs can open behind whatever else is
+    frontmost. This asks System Events to make our own process frontmost
+    right before showing a dialog. Best-effort - failures are ignored.
+    """
+
+    if sys.platform != "darwin":
+        return
+
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                (
+                    'tell application "System Events" to set frontmost of '
+                    f"(first process whose unix id is {os.getpid()}) to true"
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _initial_directory(path_value: str) -> str:
+    """Pick a starting directory for a native dialog.
+
+    Prefers the directory of the given (already-typed/selected) path when
+    it resolves to something real, so re-opening Browse continues from
+    wherever you're already working; falls back to the project root
+    otherwise, rather than whatever directory the loader happened to be
+    launched from.
+    """
+
+    candidate = path_value.strip()
+
+    if candidate:
+        path = Path(candidate).expanduser().resolve()
+        directory = path if path.is_dir() else path.parent
+
+        if directory.is_dir():
+            return str(directory)
+
+    return str(PROJECT_ROOT)
+
+
+def _run_native_dialog(dialog_fn, **kwargs):
+    """Run a tkinter file/directory dialog on the server's own desktop.
+
+    This app's Trame server and browser tab always run on the same machine,
+    so a native OS picker here (rather than a browser <input type=file>,
+    which never exposes a real filesystem path) gives a real absolute path
+    usable by the rest of the loader.
+    """
+
+    _activate_process_frontmost()
+
+    root = tk.Tk()
+    root.withdraw()
+    root.lift()
+    root.attributes("-topmost", True)
+    root.focus_force()
+
+    try:
+        return dialog_fn(**kwargs)
+    finally:
+        root.destroy()
 
 
 def read_registration_template(template_path: Path) -> nib.spatialimages.SpatialImage:
@@ -41,6 +126,29 @@ def read_registration_template(template_path: Path) -> nib.spatialimages.Spatial
         raise FileNotFoundError(f"Template image does not exist: {template_path}")
 
     return nib.load(str(template_path))
+
+
+def _expand_tractogram_entry(value: str) -> list[Path]:
+    """Resolve one loader tractogram entry, expanding a folder into its files."""
+
+    path = Path(value).expanduser()
+
+    if path.is_dir():
+        matches = sorted(
+            child
+            for child in path.iterdir()
+            if child.is_file() and child.suffix.lower() in SUPPORTED_EXTENSIONS
+        )
+
+        if not matches:
+            supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+            raise ValueError(
+                f"Folder has no supported tractogram files ({supported}): {path}"
+            )
+
+        return matches
+
+    return [path]
 
 
 def resolve_loader_scene(
@@ -65,9 +173,13 @@ def resolve_loader_scene(
         if not cleaned_tractograms:
             raise ValueError("Add at least one tractogram")
 
+        expanded_tractograms: list[Path] = []
+        for value in cleaned_tractograms:
+            expanded_tractograms.extend(_expand_tractogram_entry(value))
+
         scene = scene_from_inputs(
             Path(reference_path.strip()),
-            [Path(value) for value in cleaned_tractograms],
+            expanded_tractograms,
         )
 
     if template_path.strip():
@@ -141,6 +253,12 @@ class LoaderController:
     def _register_controller_actions(self) -> None:
         self.ctrl.load_demo_scene = self.load_demo_scene
         self.ctrl.use_demo_template = self.use_demo_template
+        self.ctrl.browse_recipe = self.browse_recipe
+        self.ctrl.browse_reference = self.browse_reference
+        self.ctrl.browse_tractograms = self.browse_tractograms
+        self.ctrl.browse_tractogram_folder = self.browse_tractogram_folder
+        self.ctrl.browse_template = self.browse_template
+        self.ctrl.browse_output_directory = self.browse_output_directory
         self.ctrl.launch = self.launch
 
     def _flush_state(self) -> None:
@@ -161,6 +279,74 @@ class LoaderController:
         self.state.status_message = "Demo template selected"
         self.state.status_type = "info"
 
+    def _last_tractogram_entry(self) -> str:
+        lines = [line for line in self.state.tractogram_paths_text.splitlines() if line.strip()]
+        return lines[-1] if lines else ""
+
+    def browse_recipe(self) -> None:
+        path = _run_native_dialog(
+            filedialog.askopenfilename,
+            title="Choose a recipe file",
+            filetypes=ALL_FILES_FILETYPES,
+            initialdir=_initial_directory(self.state.recipe_path),
+        )
+        if path:
+            self.state.recipe_path = path
+
+    def browse_reference(self) -> None:
+        path = _run_native_dialog(
+            filedialog.askopenfilename,
+            title="Choose a reference image",
+            filetypes=ALL_FILES_FILETYPES,
+            initialdir=_initial_directory(self.state.reference_path),
+        )
+        if path:
+            self.state.reference_path = path
+
+    def browse_tractograms(self) -> None:
+        paths = _run_native_dialog(
+            filedialog.askopenfilenames,
+            title="Choose tractogram files",
+            filetypes=ALL_FILES_FILETYPES,
+            initialdir=_initial_directory(self._last_tractogram_entry()),
+        )
+        if paths:
+            existing = [
+                line for line in self.state.tractogram_paths_text.splitlines() if line.strip()
+            ]
+            self.state.tractogram_paths_text = "\n".join([*existing, *paths])
+
+    def browse_tractogram_folder(self) -> None:
+        path = _run_native_dialog(
+            filedialog.askdirectory,
+            title="Choose a folder of tractogram files",
+            initialdir=_initial_directory(self._last_tractogram_entry()),
+        )
+        if path:
+            existing = [
+                line for line in self.state.tractogram_paths_text.splitlines() if line.strip()
+            ]
+            self.state.tractogram_paths_text = "\n".join([*existing, path])
+
+    def browse_template(self) -> None:
+        path = _run_native_dialog(
+            filedialog.askopenfilename,
+            title="Choose a registration template",
+            filetypes=ALL_FILES_FILETYPES,
+            initialdir=_initial_directory(self.state.template_path),
+        )
+        if path:
+            self.state.template_path = path
+
+    def browse_output_directory(self) -> None:
+        path = _run_native_dialog(
+            filedialog.askdirectory,
+            title="Choose an output directory",
+            initialdir=_initial_directory(self.state.output_directory),
+        )
+        if path:
+            self.state.output_directory = path
+
     async def launch(self) -> None:
         state = self.state
         state.launching = True
@@ -180,26 +366,27 @@ class LoaderController:
                 template_path=template_path,
             )
             staged_path = validate_and_stage_scene(scene, output_directory)
-        except Exception as error:  # noqa: BLE001 - surfaced to the loader UI
+        except Exception as error:
             state.status_message = f"{type(error).__name__}: {error}"
             state.status_type = "error"
             state.launching = False
             self._flush_state()
             return
 
-        # Launch the real viewer as its own process on a freshly picked port
-        # (never the loader's own port, which is still in use) rather than
-        # killing this process and hoping the browser reconnects: Trame's
-        # widget tree (including the viewer's per-tract controls) is only
-        # ever built once, so the real app needs its own process/module
-        # import regardless. Keeping the loader alive means we can wait,
-        # server-side, for the viewer to actually be listening - no racing
-        # against an HTTP response that might come from a half-initialized
-        # server - and only then tell the still-connected browser to move on.
         viewer_port = find_free_port()
         state.status_message = "Scene validated; starting viewer..."
         state.status_type = "info"
         self._flush_state()
+
+        # Detach the viewer so it outlives this process (which exits shortly
+        # after handing off) regardless of platform: start_new_session is
+        # POSIX-only (a harmless no-op on Windows), so Windows instead gets
+        # its own process-group flag to the same effect.
+        detach_kwargs: dict[str, Any] = (
+            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+            if sys.platform == "win32"
+            else {"start_new_session": True}
+        )
 
         subprocess.Popen(
             [
@@ -212,8 +399,9 @@ class LoaderController:
                 str(output_directory),
                 "--app-port",
                 str(viewer_port),
+                "--no-browser",
             ],
-            start_new_session=True,
+            **detach_kwargs,
         )
 
         ready = await wait_for_port(viewer_port)
@@ -242,8 +430,6 @@ def build_loader_ui(server: Any, controller: LoaderController) -> Any:
 
     with SinglePageLayout(server) as layout:
         layout.title.set_text("TractFigure Studio")
-        # LoaderController.launch sets state.viewer_url then calls .exec() on
-        # this once the real viewer is confirmed listening on its own port.
         controller.navigate_eval = client.JSEval(exec="window.location.href = viewer_url;")
 
         with layout.content:
@@ -269,20 +455,29 @@ def build_loader_ui(server: Any, controller: LoaderController) -> Any:
                         classes="pa-0",
                         v_show="loader_mode === 'recipe'",
                     ):
-                        v3.VTextField(
-                            label="Recipe JSON path",
-                            v_model=("recipe_path", controller.state.recipe_path),
-                            variant="outlined",
-                            density="compact",
-                            hide_details=True,
-                            classes="mb-2",
-                        )
+                        with v3.VRow(classes="ma-0 align-center"):
+                            with v3.VCol(cols=9, classes="pa-0 pr-2"):
+                                v3.VTextField(
+                                    label="Recipe JSON path",
+                                    v_model=("recipe_path", controller.state.recipe_path),
+                                    variant="outlined",
+                                    density="compact",
+                                    hide_details=True,
+                                )
+                            with v3.VCol(cols=3, classes="pa-0"):
+                                v3.VBtn(
+                                    "Browse...",
+                                    click=ctrl.browse_recipe,
+                                    size="small",
+                                    variant="tonal",
+                                )
                         v3.VBtn(
                             "Load demo scene",
                             prepend_icon="mdi-flask-outline",
                             click=ctrl.load_demo_scene,
                             size="small",
                             variant="tonal",
+                            classes="mt-2",
                         )
 
                     with v3.VContainer(
@@ -290,17 +485,25 @@ def build_loader_ui(server: Any, controller: LoaderController) -> Any:
                         classes="pa-0",
                         v_show="loader_mode === 'individual'",
                     ):
-                        v3.VTextField(
-                            label="Reference image (.nii/.nii.gz)",
-                            v_model=("reference_path", controller.state.reference_path),
-                            variant="outlined",
-                            density="compact",
-                            hide_details=True,
-                            classes="mb-2",
-                        )
+                        with v3.VRow(classes="ma-0 align-center"):
+                            with v3.VCol(cols=9, classes="pa-0 pr-2"):
+                                v3.VTextField(
+                                    label="Reference image (.nii/.nii.gz)",
+                                    v_model=("reference_path", controller.state.reference_path),
+                                    variant="outlined",
+                                    density="compact",
+                                    hide_details=True,
+                                )
+                            with v3.VCol(cols=3, classes="pa-0"):
+                                v3.VBtn(
+                                    "Browse...",
+                                    click=ctrl.browse_reference,
+                                    size="small",
+                                    variant="tonal",
+                                )
 
                         v3.VTextarea(
-                            label="Tractograms (one path per line)",
+                            label="Tractograms (one file or folder per line)",
                             v_model=(
                                 "tractogram_paths_text",
                                 controller.state.tractogram_paths_text,
@@ -310,6 +513,21 @@ def build_loader_ui(server: Any, controller: LoaderController) -> Any:
                             hide_details=True,
                             rows=3,
                             auto_grow=True,
+                            classes="mt-2",
+                        )
+                        v3.VBtn(
+                            "Browse files...",
+                            click=ctrl.browse_tractograms,
+                            size="small",
+                            variant="tonal",
+                            classes="mt-2 mr-2",
+                        )
+                        v3.VBtn(
+                            "Browse folder...",
+                            click=ctrl.browse_tractogram_folder,
+                            size="small",
+                            variant="tonal",
+                            classes="mt-2",
                         )
 
                     v3.VDivider(classes="my-3")
@@ -325,35 +543,53 @@ def build_loader_ui(server: Any, controller: LoaderController) -> Any:
                         density="compact",
                     )
 
-                    with v3.VRow(
+                    with v3.VContainer(
+                        fluid=True,
+                        classes="pa-0",
                         v_if="register_to_template",
-                        classes="ma-0 align-center mt-1",
                     ):
+                        with v3.VRow(classes="ma-0 align-center mt-1"):
+                            with v3.VCol(cols=6, classes="pa-0 pr-2"):
+                                v3.VTextField(
+                                    label="Template image",
+                                    v_model=("template_path", controller.state.template_path),
+                                    variant="outlined",
+                                    density="compact",
+                                    hide_details=True,
+                                )
+                            with v3.VCol(cols=3, classes="pa-0 pr-2"):
+                                v3.VBtn(
+                                    "Browse...",
+                                    click=ctrl.browse_template,
+                                    size="small",
+                                    variant="tonal",
+                                )
+                            with v3.VCol(cols=3, classes="pa-0"):
+                                v3.VBtn(
+                                    "Use demo template",
+                                    click=ctrl.use_demo_template,
+                                    size="small",
+                                    variant="tonal",
+                                )
+
+                    v3.VDivider(classes="my-3")
+
+                    with v3.VRow(classes="ma-0 align-center"):
                         with v3.VCol(cols=9, classes="pa-0 pr-2"):
                             v3.VTextField(
-                                label="Template image",
-                                v_model=("template_path", controller.state.template_path),
+                                label="Output directory",
+                                v_model=("output_directory", controller.state.output_directory),
                                 variant="outlined",
                                 density="compact",
                                 hide_details=True,
                             )
                         with v3.VCol(cols=3, classes="pa-0"):
                             v3.VBtn(
-                                "Use demo template",
-                                click=ctrl.use_demo_template,
+                                "Browse...",
+                                click=ctrl.browse_output_directory,
                                 size="small",
                                 variant="tonal",
                             )
-
-                    v3.VDivider(classes="my-3")
-
-                    v3.VTextField(
-                        label="Output directory",
-                        v_model=("output_directory", controller.state.output_directory),
-                        variant="outlined",
-                        density="compact",
-                        hide_details=True,
-                    )
 
                     v3.VAlert(
                         type=("status_type", "info"),
